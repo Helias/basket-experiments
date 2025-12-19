@@ -45,6 +45,10 @@
         >Upload Video: <input type="file" id="videoInput" accept="video/*"
       /></label>
        -->
+      <label style="display: block; margin-bottom: 10px">
+        <input type="checkbox" id="useWorkerCheckbox" checked />
+        Use Web Worker (uncheck for main thread comparison)
+      </label>
       <p id="status">Status: Waiting for inputs...</p>
     </div>
 
@@ -158,6 +162,19 @@
       const ctx = canvas.getContext("2d");
       const status = document.getElementById("status");
 
+      // Performance comparison flag
+      let useWebWorker = document.getElementById("useWorkerCheckbox").checked;
+
+      // Web Worker & Job Queue
+      let worker = null;
+      let jobQueue = [];
+      let processingJobs = new Map();
+      let frameIdCounter = 0;
+      let maxConcurrentJobs = 3;
+      let maxQueueSize = 10;
+      let lastDisplayedFrameId = -1;
+      let isWorkerReady = false;
+
       //   // --- 1. LOAD MODEL ---
       //   document
       //     .getElementById("modelInput")
@@ -194,35 +211,146 @@
       const MODEL_PATH = "./yolo11n-detect.onnx"; // Change to your model filename
       const VIDEO_PATH = "./basket-sp.mp4"; // Change to your video filename
 
+      // Listen to checkbox changes
+      document.addEventListener("DOMContentLoaded", () => {
+        const checkbox = document.getElementById("useWorkerCheckbox");
+        useWebWorker = checkbox.checked;
+        checkbox.addEventListener("change", (e) => {
+          alert("Please reload the page for mode change to take effect.");
+        });
+      });
+
       // --- 1. AUTO-INIT ON LOAD ---
       window.onload = async () => {
         try {
-          status.textContent = "Status: Downloading Model & Video...";
+          const checkbox = document.getElementById("useWorkerCheckbox");
+          useWebWorker = checkbox.checked;
 
-          // A. Load Model via Fetch
-          const modelResponse = await fetch(MODEL_PATH);
-          const modelBuffer = await modelResponse.arrayBuffer();
+          if (useWebWorker) {
+            status.textContent = "Status: Initializing Web Worker...";
+            worker = new Worker("./detection-worker.js");
 
-          // Initialize Session (Try WebGPU -> WebGL -> WASM)
-          session = await ort.InferenceSession.create(modelBuffer, {
-            executionProviders: ["webgpu", "webgl", "wasm"],
-          });
+            // Setup worker message handler
+            worker.onmessage = handleWorkerMessage;
+            worker.onerror = (error) => {
+              status.textContent = `Worker Error: ${error.message}`;
+              console.error("Worker error:", error);
+            };
 
-          // B. Set Video Source
+            // B. Initialize model in worker
+            worker.postMessage({
+              type: "INIT",
+              data: { modelPath: MODEL_PATH },
+            });
+          } else {
+            // Main Thread Mode
+            status.textContent = "Status: Loading model on main thread...";
+            const modelResponse = await fetch(MODEL_PATH);
+            const modelBuffer = await modelResponse.arrayBuffer();
+
+            session = await ort.InferenceSession.create(modelBuffer, {
+              executionProviders: ["webgl", "wasm"],
+              graphOptimizationLevel: "all",
+            });
+
+            console.log("[Main Thread] Model loaded");
+          }
+
+          // C. Set Video Source
           video.src = VIDEO_PATH;
 
-          // Wait for video metadata (to set canvas size)
+          // Wait for video metadata
           video.onloadedmetadata = () => {
             canvas.width = video.clientWidth;
             canvas.height = video.clientHeight;
-            status.textContent = "Status: Ready! Click Start.";
-            startBtn.disabled = false;
+            if (useWebWorker && isWorkerReady) {
+              status.textContent = "Status: Ready! Play video (Worker mode)";
+            } else if (!useWebWorker) {
+              status.textContent =
+                "Status: Ready! Play video (Main Thread mode)";
+            }
           };
         } catch (err) {
-          status.textContent = `Status: ❌ Error: ${err.message}. (Did you run a local server?)`;
+          status.textContent = `Status: ❌ Error: ${err.message}`;
           console.error(err);
         }
       };
+
+      // Handle messages from worker
+      function handleWorkerMessage(e) {
+        const { type, frameId, output, processingTime, error } = e.data;
+
+        switch (type) {
+          case "MODEL_LOADED":
+            isWorkerReady = true;
+            status.textContent = "Status: Ready! Play video (Worker mode)";
+            console.log("Worker ready with model");
+            break;
+
+          case "FRAME_PROCESSED":
+            // Draw only newest frames
+            if (output && frameId > lastDisplayedFrameId) {
+              drawDetections({
+                data: new Float32Array(output.data),
+                dims: output.dims,
+              });
+              lastDisplayedFrameId = frameId;
+              // console.log(`Frame ${frameId} displayed (${processingTime}ms)`);
+            }
+
+            // Remove from processing queue
+            processingJobs.delete(frameId);
+
+            // Process next job
+            processNextJob();
+            break;
+
+          case "ERROR":
+            console.error("Worker error:", error);
+            if (frameId !== undefined) {
+              processingJobs.delete(frameId);
+              processNextJob();
+            }
+            break;
+        }
+      }
+
+      // Process next job from queue
+      function processNextJob() {
+        while (jobQueue.length > 0 && processingJobs.size < maxConcurrentJobs) {
+          const job = jobQueue.shift();
+          processingJobs.set(job.frameId, job);
+
+          worker.postMessage({
+            type: "PROCESS_FRAME",
+            data: job,
+          });
+
+          // console.log(
+          //   `Processing frame ${job.frameId} (${processingJobs.size}/${maxConcurrentJobs} busy, ${jobQueue.length} queued)`
+          // );
+        }
+      }
+
+      // Add job to queue
+      function enqueueJob(imageData) {
+        const frameId = frameIdCounter++;
+
+        // Drop old frames if queue is full
+        if (jobQueue.length >= maxQueueSize) {
+          const dropped = jobQueue.shift();
+          // console.log(`Dropped frame ${dropped.frameId} (queue full)`);
+        }
+
+        const job = {
+          frameId,
+          timestamp: video.currentTime,
+          imageData,
+        };
+
+        jobQueue.push(job);
+        processNextJob();
+      }
 
       // --- 3. MAIN LOOP HANDLERS ---
       video.addEventListener("play", () => {
@@ -239,64 +367,81 @@
         isProcessing = false;
       });
 
-      // --- 4. CORE PROCESSING LOOP (Modified) ---
+      // --- 4. CORE PROCESSING LOOP (Supports both Worker and Main Thread) ---
       async function processFrame() {
-        if (!isProcessing || !session || video.ended) return;
+        if (!isProcessing || video.ended) return;
+        if (useWebWorker && !isWorkerReady) return;
+        if (!useWebWorker && !session) return;
 
-        // A. PAUSE Video & Start Timer
-        // video.pause();
-        const startTime = performance.now();
+        const frameStart = performance.now();
 
         try {
-          // B. Preprocess
-          const inputTensor = await preprocess(video);
+          // Capture frame from video
+          const offScreenCanvas = document.createElement("canvas");
+          offScreenCanvas.width = MODEL_INPUT_SIZE;
+          offScreenCanvas.height = MODEL_INPUT_SIZE;
+          const tempCtx = offScreenCanvas.getContext("2d");
+          tempCtx.drawImage(video, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+          const imageData = tempCtx.getImageData(
+            0,
+            0,
+            MODEL_INPUT_SIZE,
+            MODEL_INPUT_SIZE
+          );
 
-          // C. Inference
-          const feeds = {};
-          feeds[session.inputNames[0]] = inputTensor;
-          const results = await session.run(feeds);
+          if (useWebWorker) {
+            // Web Worker Mode - use job queue
+            enqueueJob({
+              data: Array.from(imageData.data),
+              width: imageData.width,
+              height: imageData.height,
+            });
 
-          // D. Postprocess & Draw
-          const outputName = session.outputNames[0];
-          const outputTensor = results[outputName];
-          drawDetections(outputTensor);
+            // Log stats periodically
+            if (frameIdCounter % 30 === 0) {
+              console.log(
+                `[Worker] Stats: ${jobQueue.length} queued, ${
+                  processingJobs.size
+                } processing, ${
+                  lastDisplayedFrameId + 1
+                }/${frameIdCounter} displayed`
+              );
+            }
+          } else {
+            // Main Thread Mode - process directly
+            const inputTensor = preprocessOnMainThread(imageData);
+
+            const inferenceStart = performance.now();
+            const feeds = {};
+            feeds[session.inputNames[0]] = inputTensor;
+            const results = await session.run(feeds);
+            const inferenceTime = (performance.now() - inferenceStart).toFixed(
+              2
+            );
+
+            const outputName = session.outputNames[0];
+            const outputTensor = results[outputName];
+
+            drawDetections(outputTensor);
+
+            const totalTime = (performance.now() - frameStart).toFixed(2);
+
+            if (frameIdCounter++ % 30 === 0) {
+              console.log(
+                `[Main Thread] Frame processed in ${totalTime}ms (Inference: ${inferenceTime}ms)`
+              );
+            }
+          }
         } catch (err) {
-          console.error("Inference error:", err);
-          isProcessing = false;
-          return; // Stop loop on error
+          console.error("Frame processing error:", err);
         }
 
-        // E. End Timer & Log
-        const endTime = performance.now();
-        const duration = (endTime - startTime).toFixed(2);
-        console.log(`Frame processed in: ${duration} ms`);
-
-        // F. RESUME Video & Loop
-        // We play the video, then immediately request the next frame check.
-        // The browser will render the next video frame, then hit this loop again.
-        try {
-          //   await video.play();
-          requestAnimationFrame(processFrame);
-        } catch (e) {
-          // Handle case where play() is interrupted
-          console.log("Playback interrupted");
-        }
+        // Continue loop
+        requestAnimationFrame(processFrame);
       }
 
-      // --- 5. PRE-PROCESSING ---
-      async function preprocess(videoSource) {
-        const offScreenCanvas = document.createElement("canvas");
-        offScreenCanvas.width = MODEL_INPUT_SIZE;
-        offScreenCanvas.height = MODEL_INPUT_SIZE;
-        const ctx = offScreenCanvas.getContext("2d");
-        ctx.drawImage(videoSource, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-
-        const imageData = ctx.getImageData(
-          0,
-          0,
-          MODEL_INPUT_SIZE,
-          MODEL_INPUT_SIZE
-        );
+      // Preprocessing for main thread
+      function preprocessOnMainThread(imageData) {
         const { data } = imageData;
         const float32Data = new Float32Array(
           3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE
@@ -310,6 +455,7 @@
           float32Data[i + MODEL_INPUT_SIZE * MODEL_INPUT_SIZE] = g;
           float32Data[i + 2 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE] = b;
         }
+
         return new ort.Tensor("float32", float32Data, [
           1,
           3,
@@ -317,6 +463,9 @@
           MODEL_INPUT_SIZE,
         ]);
       }
+
+      // --- 5. PRE-PROCESSING (Moved to Worker) ---
+      // Preprocessing now happens in detection-worker.js for parallel processing
 
       // --- 6. POST-PROCESSING (YOLOv11/v8 Logic) ---
       function drawDetections(output) {
