@@ -206,6 +206,8 @@
       let totalFramesToProcess = 0;
       let framesProcessed = 0;
       let videoFPS = 30; // Will be calculated from video
+      let processingStartTime = 0;
+      let processingTimerInterval = null;
 
       //   // --- 1. LOAD MODEL ---
       //   document
@@ -240,8 +242,8 @@
       //     }
       //   });
 
-      // const MODEL_PATH = "./yolo11n-detect.onnx";
-      const MODEL_PATH = "./best---dynamic.onnx";
+      const MODEL_PATH = "./yolo11n-detect.onnx";
+      // const MODEL_PATH = "./best---dynamic.onnx";
       // const VIDEO_PATH = "./basket-sp.mp4";
       const VIDEO_PATH = "./input10s.mp4";
 
@@ -298,10 +300,9 @@
             canvas.width = video.clientWidth;
             canvas.height = video.clientHeight;
 
-            // Calculate total frames and FPS (limit to 3 seconds for testing)
+            // Calculate total frames and FPS
             videoFPS = 30; // Default, actual FPS detection is complex in browser
-            const testDuration = Math.min(3, video.duration); // Only process 3 seconds
-            totalFramesToProcess = Math.ceil(testDuration * videoFPS);
+            totalFramesToProcess = Math.ceil(video.duration * videoFPS);
 
             if (useWebWorker && isWorkerReady) {
               status.textContent = `Status: Ready! Click "Start Processing" to analyze video (${totalFramesToProcess} frames)`;
@@ -361,7 +362,11 @@
                   (framesProcessed / totalFramesToProcess) *
                   100
                 ).toFixed(1);
-                status.textContent = `Processing video: ${framesProcessed}/${totalFramesToProcess} frames (${progress}%)`;
+                const elapsedSeconds = (
+                  (Date.now() - processingStartTime) /
+                  1000
+                ).toFixed(1);
+                status.textContent = `Processing video: ${framesProcessed}/${totalFramesToProcess} frames (${progress}%) - Elapsed: ${elapsedSeconds}s`;
               }
             }
 
@@ -435,8 +440,24 @@
         framesProcessed = 0;
         frameAnnotations.clear();
         frameIdCounter = 0;
+        processingStartTime = Date.now();
         document.getElementById("startProcessing").style.display = "none";
-        status.textContent = "Starting video preprocessing...";
+        status.textContent = "Starting video preprocessing... (0.0s)";
+
+        // Start timer to update elapsed time
+        processingTimerInterval = setInterval(() => {
+          if (isPreprocessing) {
+            const elapsedSeconds = (
+              (Date.now() - processingStartTime) /
+              1000
+            ).toFixed(1);
+            const progress = (
+              (framesProcessed / totalFramesToProcess) *
+              100
+            ).toFixed(1);
+            status.textContent = `Processing video: ${framesProcessed}/${totalFramesToProcess} frames (${progress}%) - Elapsed: ${elapsedSeconds}s`;
+          }
+        }, 100); // Update every 100ms
 
         console.log(
           `[Preprocess] Starting to process ${totalFramesToProcess} frames`,
@@ -555,13 +576,23 @@
         isPreprocessing = false;
         preprocessingComplete = true;
 
+        // Stop the timer
+        if (processingTimerInterval) {
+          clearInterval(processingTimerInterval);
+          processingTimerInterval = null;
+        }
+
+        const totalTime = ((Date.now() - processingStartTime) / 1000).toFixed(
+          1,
+        );
+
         console.log(
-          `[Preprocess] Complete! Processed ${framesProcessed} frames`,
+          `[Preprocess] Complete! Processed ${framesProcessed} frames in ${totalTime}s`,
         );
         console.log(
           `[Preprocess] Frame annotations stored: ${frameAnnotations.size}`,
         );
-        status.textContent = `✅ Processing complete! ${framesProcessed} frames analyzed. You can now watch the video.`;
+        status.textContent = `✅ Processing complete! ${framesProcessed} frames analyzed in ${totalTime}s. You can now watch the video.`;
 
         // Show video, canvas and enable controls
         video.style.display = "block";
