@@ -212,7 +212,7 @@
       let frameAnnotations = new Map(); // Store all frame annotations
       let totalFramesToProcess = 0;
       let framesProcessed = 0;
-      let videoFPS = 30; // Will be calculated from video
+      let videoFPS = 5; // 30;
       let processingStartTime = 0;
       let processingTimerInterval = null;
 
@@ -251,8 +251,8 @@
 
       const MODEL_PATH = "./yolo11n-detect.onnx";
       // const MODEL_PATH = "./best---dynamic.onnx";
-      // const VIDEO_PATH = "./basket-sp.mp4";
-      const VIDEO_PATH = "./input10s.mp4";
+      const VIDEO_PATH = "./basket-sp.mp4";
+      // const VIDEO_PATH = "./input10s.mp4";
 
       // Listen to checkbox changes
       document.addEventListener("DOMContentLoaded", () => {
@@ -308,7 +308,6 @@
             canvas.height = video.clientHeight;
 
             // Calculate total frames and FPS
-            videoFPS = 30; // Default, actual FPS detection is complex in browser
             totalFramesToProcess = Math.ceil(video.duration * videoFPS);
 
             if (useWebWorker && isWorkerReady) {
