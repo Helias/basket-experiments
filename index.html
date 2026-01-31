@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -23,6 +23,7 @@
         top: 0;
         left: 0;
         pointer-events: none;
+        border: 2px solid red; /* Debug border to see canvas */
       }
       .controls {
         margin-bottom: 20px;
@@ -45,16 +46,39 @@
         >Upload Video: <input type="file" id="videoInput" accept="video/*"
       /></label>
        -->
-      <label style="display: block; margin-bottom: 10px">
-        <input type="checkbox" id="useWorkerCheckbox" checked />
+      <label style="display: none; margin-bottom: 10px">
+        <input type="checkbox" id="useWorkerCheckbox" />
         Use Web Worker (uncheck for main thread comparison)
       </label>
       <p id="status">Status: Waiting for inputs...</p>
+      <button
+        id="startProcessing"
+        style="
+          display: none;
+          padding: 10px 20px;
+          font-size: 16px;
+          cursor: pointer;
+        "
+      >
+        Start Processing Video
+      </button>
     </div>
 
     <div class="container">
-      <video id="video" width="1140" height="640" controls muted></video>
-      <canvas id="canvas" width="1140" height="640"></canvas>
+      <video
+        id="video"
+        width="1140"
+        height="640"
+        controls
+        muted
+        style="display: none"
+      ></video>
+      <canvas
+        id="canvas"
+        width="1140"
+        height="640"
+        style="display: none"
+      ></canvas>
     </div>
 
     <script>
@@ -175,6 +199,14 @@
       let lastDisplayedFrameId = -1;
       let isWorkerReady = false;
 
+      // Video preprocessing state
+      let isPreprocessing = false;
+      let preprocessingComplete = false;
+      let frameAnnotations = new Map(); // Store all frame annotations
+      let totalFramesToProcess = 0;
+      let framesProcessed = 0;
+      let videoFPS = 30; // Will be calculated from video
+
       //   // --- 1. LOAD MODEL ---
       //   document
       //     .getElementById("modelInput")
@@ -208,8 +240,10 @@
       //     }
       //   });
 
-      const MODEL_PATH = "./yolo11n-detect.onnx"; // Change to your model filename
-      const VIDEO_PATH = "./basket-sp.mp4"; // Change to your video filename
+      // const MODEL_PATH = "./yolo11n-detect.onnx";
+      const MODEL_PATH = "./best---dynamic.onnx";
+      // const VIDEO_PATH = "./basket-sp.mp4";
+      const VIDEO_PATH = "./input10s.mp4";
 
       // Listen to checkbox changes
       document.addEventListener("DOMContentLoaded", () => {
@@ -263,11 +297,20 @@
           video.onloadedmetadata = () => {
             canvas.width = video.clientWidth;
             canvas.height = video.clientHeight;
+
+            // Calculate total frames and FPS (limit to 3 seconds for testing)
+            videoFPS = 30; // Default, actual FPS detection is complex in browser
+            const testDuration = Math.min(3, video.duration); // Only process 3 seconds
+            totalFramesToProcess = Math.ceil(testDuration * videoFPS);
+
             if (useWebWorker && isWorkerReady) {
-              status.textContent = "Status: Ready! Play video (Worker mode)";
+              status.textContent = `Status: Ready! Click "Start Processing" to analyze video (${totalFramesToProcess} frames)`;
+              document.getElementById("startProcessing").style.display =
+                "inline-block";
             } else if (!useWebWorker) {
-              status.textContent =
-                "Status: Ready! Play video (Main Thread mode)";
+              status.textContent = `Status: Ready! Click "Start Processing" to analyze video (${totalFramesToProcess} frames)`;
+              document.getElementById("startProcessing").style.display =
+                "inline-block";
             }
           };
         } catch (err) {
@@ -276,6 +319,15 @@
         }
       };
 
+      // Start processing button handler
+      document
+        .getElementById("startProcessing")
+        .addEventListener("click", () => {
+          if (!isPreprocessing && !preprocessingComplete) {
+            preprocessAllFrames();
+          }
+        });
+
       // Handle messages from worker
       function handleWorkerMessage(e) {
         const { type, frameId, output, processingTime, error } = e.data;
@@ -283,33 +335,56 @@
         switch (type) {
           case "MODEL_LOADED":
             isWorkerReady = true;
-            status.textContent = "Status: Ready! Play video (Worker mode)";
+            if (video.readyState >= 1) {
+              // HAVE_METADATA
+              status.textContent = `Status: Ready! Click "Start Processing" to analyze video (${totalFramesToProcess} frames)`;
+              document.getElementById("startProcessing").style.display =
+                "inline-block";
+            } else {
+              status.textContent = "Status: Ready! Waiting for video...";
+            }
             console.log("Worker ready with model");
             break;
 
           case "FRAME_PROCESSED":
-            // Draw only newest frames
-            if (output && frameId > lastDisplayedFrameId) {
-              drawDetections({
+            // Store detections for this frame
+            if (output) {
+              frameAnnotations.set(frameId, {
                 data: new Float32Array(output.data),
                 dims: output.dims,
               });
-              lastDisplayedFrameId = frameId;
-              // console.log(`Frame ${frameId} displayed (${processingTime}ms)`);
+              framesProcessed++;
+
+              // Update progress
+              if (isPreprocessing) {
+                const progress = (
+                  (framesProcessed / totalFramesToProcess) *
+                  100
+                ).toFixed(1);
+                status.textContent = `Processing video: ${framesProcessed}/${totalFramesToProcess} frames (${progress}%)`;
+              }
             }
 
             // Remove from processing queue
             processingJobs.delete(frameId);
 
-            // Process next job
-            processNextJob();
+            // Process next job or finish
+            if (isPreprocessing) {
+              processNextPreprocessJob();
+            } else {
+              processNextJob();
+            }
             break;
 
           case "ERROR":
             console.error("Worker error:", error);
             if (frameId !== undefined) {
               processingJobs.delete(frameId);
-              processNextJob();
+              if (isPreprocessing) {
+                processNextPreprocessJob();
+              } else {
+                processNextJob();
+              }
             }
             break;
         }
@@ -325,22 +400,231 @@
             type: "PROCESS_FRAME",
             data: job,
           });
-
-          // console.log(
-          //   `Processing frame ${job.frameId} (${processingJobs.size}/${maxConcurrentJobs} busy, ${jobQueue.length} queued)`
-          // );
         }
       }
 
-      // Add job to queue
+      // Process next job during preprocessing
+      function processNextPreprocessJob() {
+        while (jobQueue.length > 0 && processingJobs.size < maxConcurrentJobs) {
+          const job = jobQueue.shift();
+          processingJobs.set(job.frameId, job);
+
+          if (useWebWorker) {
+            worker.postMessage({
+              type: "PROCESS_FRAME",
+              data: job,
+            });
+          }
+        }
+
+        // Check if preprocessing is complete
+        if (
+          jobQueue.length === 0 &&
+          processingJobs.size === 0 &&
+          isPreprocessing
+        ) {
+          finishPreprocessing();
+        }
+      }
+
+      // Preprocess all frames in the video
+      async function preprocessAllFrames() {
+        if (isPreprocessing || preprocessingComplete) return;
+
+        isPreprocessing = true;
+        framesProcessed = 0;
+        frameAnnotations.clear();
+        frameIdCounter = 0;
+        document.getElementById("startProcessing").style.display = "none";
+        status.textContent = "Starting video preprocessing...";
+
+        console.log(
+          `[Preprocess] Starting to process ${totalFramesToProcess} frames`,
+        );
+
+        // Seek through video and capture all frames
+        video.currentTime = 0;
+        const frameDuration = 1 / videoFPS;
+
+        const captureFrame = async (frameNumber) => {
+          return new Promise((resolve) => {
+            const targetTime = frameNumber * frameDuration;
+
+            video.onseeked = () => {
+              // Capture frame
+              const offScreenCanvas = document.createElement("canvas");
+              offScreenCanvas.width = MODEL_INPUT_SIZE;
+              offScreenCanvas.height = MODEL_INPUT_SIZE;
+              const tempCtx = offScreenCanvas.getContext("2d");
+              tempCtx.drawImage(
+                video,
+                0,
+                0,
+                MODEL_INPUT_SIZE,
+                MODEL_INPUT_SIZE,
+              );
+              const imageData = tempCtx.getImageData(
+                0,
+                0,
+                MODEL_INPUT_SIZE,
+                MODEL_INPUT_SIZE,
+              );
+
+              resolve(imageData);
+            };
+
+            video.currentTime = Math.min(targetTime, video.duration - 0.001);
+          });
+        };
+
+        // Process frames sequentially
+        for (let frameNum = 0; frameNum < totalFramesToProcess; frameNum++) {
+          const imageData = await captureFrame(frameNum);
+
+          const job = {
+            frameId: frameNum,
+            timestamp: frameNum * frameDuration,
+            imageData: {
+              data: Array.from(imageData.data),
+              width: imageData.width,
+              height: imageData.height,
+            },
+          };
+
+          if (useWebWorker) {
+            jobQueue.push(job);
+            processNextPreprocessJob();
+          } else {
+            // Main thread processing
+            await processFrameMainThread(job);
+          }
+
+          // Wait a bit if queue is getting full
+          while (
+            jobQueue.length >= maxQueueSize ||
+            processingJobs.size >= maxConcurrentJobs
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+
+        // Wait for all processing to complete
+        if (!useWebWorker) {
+          finishPreprocessing();
+        }
+      }
+
+      // Main thread frame processing
+      async function processFrameMainThread(job) {
+        const { frameId, timestamp, imageData } = job;
+
+        try {
+          const inputTensor = preprocessOnMainThread(
+            new ImageData(
+              new Uint8ClampedArray(imageData.data),
+              imageData.width,
+              imageData.height,
+            ),
+          );
+
+          const feeds = {};
+          feeds[session.inputNames[0]] = inputTensor;
+          const results = await session.run(feeds);
+
+          const outputName = session.outputNames[0];
+          const outputTensor = results[outputName];
+
+          frameAnnotations.set(frameId, {
+            data: new Float32Array(outputTensor.data),
+            dims: outputTensor.dims,
+          });
+
+          framesProcessed++;
+          const progress = (
+            (framesProcessed / totalFramesToProcess) *
+            100
+          ).toFixed(1);
+          status.textContent = `Processing video: ${framesProcessed}/${totalFramesToProcess} frames (${progress}%)`;
+        } catch (err) {
+          console.error(`Error processing frame ${frameId}:`, err);
+        }
+      }
+
+      // Finish preprocessing and enable video playback
+      function finishPreprocessing() {
+        isPreprocessing = false;
+        preprocessingComplete = true;
+
+        console.log(
+          `[Preprocess] Complete! Processed ${framesProcessed} frames`,
+        );
+        console.log(
+          `[Preprocess] Frame annotations stored: ${frameAnnotations.size}`,
+        );
+        status.textContent = `✅ Processing complete! ${framesProcessed} frames analyzed. You can now watch the video.`;
+
+        // Show video, canvas and enable controls
+        video.style.display = "block";
+        canvas.style.display = "block";
+
+        // Ensure canvas matches video dimensions
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.style.width = video.clientWidth + "px";
+        canvas.style.height = video.clientHeight + "px";
+
+        video.currentTime = 0;
+
+        // Set up playback
+        video.removeEventListener("play", startProcessingOnPlay);
+        video.addEventListener("play", startAnnotatedPlayback);
+        video.addEventListener("ended", stopAnnotatedPlayback);
+        video.addEventListener("pause", stopAnnotatedPlayback);
+      }
+
+      // Start playing with annotations
+      function startAnnotatedPlayback() {
+        if (!isProcessing && preprocessingComplete) {
+          isProcessing = true;
+          renderAnnotatedFrame();
+        }
+      }
+
+      // Stop playback
+      function stopAnnotatedPlayback() {
+        isProcessing = false;
+      }
+
+      // Render frame with pre-computed annotations
+      function renderAnnotatedFrame() {
+        if (!isProcessing || video.paused || video.ended) {
+          isProcessing = false;
+          return;
+        }
+
+        // Find the frame closest to current time
+        const currentFrameId = Math.floor(video.currentTime * videoFPS);
+
+        // Draw the annotations for this frame
+        if (frameAnnotations.has(currentFrameId)) {
+          const annotation = frameAnnotations.get(currentFrameId);
+          console.log(
+            `[Playback] Drawing frame ${currentFrameId} at time ${video.currentTime.toFixed(2)}s`,
+          );
+          drawDetections(annotation);
+        } else {
+          console.log(
+            `[Playback] No annotation for frame ${currentFrameId} at time ${video.currentTime.toFixed(2)}s`,
+          );
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        requestAnimationFrame(renderAnnotatedFrame);
+      }
+
+      // Add job to queue (only used during preprocessing now)
       function enqueueJob(imageData) {
         const frameId = frameIdCounter++;
-
-        // Drop old frames if queue is full
-        if (jobQueue.length >= maxQueueSize) {
-          const dropped = jobQueue.shift();
-          // console.log(`Dropped frame ${dropped.frameId} (queue full)`);
-        }
 
         const job = {
           frameId,
@@ -352,99 +636,16 @@
         processNextJob();
       }
 
-      // --- 3. MAIN LOOP HANDLERS ---
-      video.addEventListener("play", () => {
-        // Only start the loop if we aren't already processing
-        if (!isProcessing) {
-          canvas.width = video.clientWidth;
-          canvas.height = video.clientHeight;
-          isProcessing = true;
-          processFrame();
-        }
-      });
-
-      video.addEventListener("ended", () => {
-        isProcessing = false;
-      });
-
-      // --- 4. CORE PROCESSING LOOP (Supports both Worker and Main Thread) ---
-      async function processFrame() {
-        if (!isProcessing || video.ended) return;
-        if (useWebWorker && !isWorkerReady) return;
-        if (!useWebWorker && !session) return;
-
-        const frameStart = performance.now();
-
-        try {
-          // Capture frame from video
-          const offScreenCanvas = document.createElement("canvas");
-          offScreenCanvas.width = MODEL_INPUT_SIZE;
-          offScreenCanvas.height = MODEL_INPUT_SIZE;
-          const tempCtx = offScreenCanvas.getContext("2d");
-          tempCtx.drawImage(video, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-          const imageData = tempCtx.getImageData(
-            0,
-            0,
-            MODEL_INPUT_SIZE,
-            MODEL_INPUT_SIZE
-          );
-
-          if (useWebWorker) {
-            // Web Worker Mode - use job queue
-            enqueueJob({
-              data: Array.from(imageData.data),
-              width: imageData.width,
-              height: imageData.height,
-            });
-
-            // Log stats periodically
-            if (frameIdCounter % 30 === 0) {
-              console.log(
-                `[Worker] Stats: ${jobQueue.length} queued, ${
-                  processingJobs.size
-                } processing, ${
-                  lastDisplayedFrameId + 1
-                }/${frameIdCounter} displayed`
-              );
-            }
-          } else {
-            // Main Thread Mode - process directly
-            const inputTensor = preprocessOnMainThread(imageData);
-
-            const inferenceStart = performance.now();
-            const feeds = {};
-            feeds[session.inputNames[0]] = inputTensor;
-            const results = await session.run(feeds);
-            const inferenceTime = (performance.now() - inferenceStart).toFixed(
-              2
-            );
-
-            const outputName = session.outputNames[0];
-            const outputTensor = results[outputName];
-
-            drawDetections(outputTensor);
-
-            const totalTime = (performance.now() - frameStart).toFixed(2);
-
-            if (frameIdCounter++ % 30 === 0) {
-              console.log(
-                `[Main Thread] Frame processed in ${totalTime}ms (Inference: ${inferenceTime}ms)`
-              );
-            }
-          }
-        } catch (err) {
-          console.error("Frame processing error:", err);
-        }
-
-        // Continue loop
-        requestAnimationFrame(processFrame);
+      // Placeholder for old play event (removed)
+      function startProcessingOnPlay() {
+        // This function is no longer used
       }
 
       // Preprocessing for main thread
       function preprocessOnMainThread(imageData) {
         const { data } = imageData;
         const float32Data = new Float32Array(
-          3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE
+          3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE,
         );
 
         for (let i = 0; i < data.length / 4; i++) {
@@ -481,6 +682,10 @@
 
         const boxes = [];
 
+        console.log(
+          `[Draw] Canvas: ${canvas.width}x${canvas.height}, Scale: ${scaleX.toFixed(2)}x${scaleY.toFixed(2)}, Anchors: ${numAnchors}`,
+        );
+
         for (let i = 0; i < numAnchors; i++) {
           let maxScore = -Infinity;
           let classIndex = -1;
@@ -514,6 +719,10 @@
 
         const selectedBoxes = nms(boxes, 0.45);
 
+        console.log(
+          `[Draw] Found ${boxes.length} boxes, after NMS: ${selectedBoxes.length}`,
+        );
+
         selectedBoxes.forEach((box) => {
           const [x1, y1, x2, y2, classIdx, score] = box;
           const color = getColor(classIdx);
@@ -541,7 +750,7 @@
           const best = boxes.shift();
           result.push(best);
           boxes = boxes.filter(
-            (other) => calculateIoU(best, other) < iouThreshold
+            (other) => calculateIoU(best, other) < iouThreshold,
           );
         }
         return result;
